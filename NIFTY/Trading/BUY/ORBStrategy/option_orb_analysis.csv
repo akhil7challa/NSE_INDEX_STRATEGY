@@ -1,0 +1,2 @@
+date,signal,underlying_price,option_symbol,option_token,strike,option_type,option_orb_high,option_orb_low,option_orb_midpoint
+2026-11-13,BUY,25153.4,NIFTY17NOV2625050CE,45388,25050.0,CE,252.75,178.0,215.38

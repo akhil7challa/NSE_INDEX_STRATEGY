@@ -1,6 +1,8 @@
 import os
-import time as time_module
-from datetime import datetime, time
+import sys
+import logging
+from pathlib import Path
+from datetime import datetime, date, time as dt_time
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -11,53 +13,84 @@ from SmartApi import SmartConnect
 # CONFIGURATION
 # ============================================================
 
+IST = ZoneInfo("Asia/Kolkata")
+
 API_KEY = "MpxkUXqu"
 CLIENT_CODE = "AAAD431807"
 PASSWORD = "1606"
 TOTP_SECRET = "H2FHHI2DVFW5HK64J3GQWMVZ3E"
 
-EXCHANGE = "NSE"
-UNDERLYING_TOKEN = "99926000"  # NIFTY 50 Index Token
-INDEX_NAME = "NIFTY 50"
+# Test Date Configuration
+TEST_DATE = date(2026, 11, 13)  # Change this to any past trading date you want to test
 
-INTERVAL = "ONE_MINUTE"
-IST = ZoneInfo("Asia/Kolkata")
-
-MAX_RETRIES = 4
-RETRY_BASE_SECONDS = 2
+INSTRUMENT_MASTER = Path(
+    r"C:\Users\challa\Desktop\Challa\Personal\NSE\NIFTY"
+    r"\AngelOne_Instruments\Options_Instrumentation\nifty_current_expiry.csv"
+)
 
 SIGNAL_FILE = "breakout_signals.csv"
 OUTPUT_FILE = "option_orb_analysis.csv"
 
-# Path to your local options instrument master CSV file
-INSTRUMENTS_CSV_PATH = r"C:\Users\challa\Desktop\Challa\Personal\NSE\NIFTY\AngelOne_Instruments\Options_Instrumentation\nifty_current_expiry.csv"
+SPOT_EXCHANGE = "NSE"
+OPTION_EXCHANGE = "NFO"
+CANDLE_INTERVAL = "ONE_MINUTE"
+
+ORB_START_TIME = dt_time(9, 15)
+ORB_END_TIME = dt_time(9, 45)
+
+CSV_TOKEN = "symboltoken"
+CSV_SYMBOL = "tradingsymbol"
+CSV_NAME = "name"
+CSV_EXPIRY = "expiry"
+CSV_STRIKE = "strike"
+CSV_LOTSIZE = "lotsize"
+CSV_TYPE = "instrumenttype"
+CSV_EXCHANGE = "exchange"
 
 # ============================================================
-# SMARTAPI LOGIN
+# LOGGING
 # ============================================================
 
-def login_to_smartapi():
-    if not all([API_KEY, CLIENT_CODE, PASSWORD, TOTP_SECRET]):
-        raise ValueError("Missing credentials. Set correct API keys and secrets.")
-
-    smart_api = SmartConnect(api_key=API_KEY)
-    totp = pyotp.TOTP(TOTP_SECRET).now()
-    session_data = smart_api.generateSession(CLIENT_CODE, PASSWORD, totp)
-
-    if not session_data or not session_data.get("status"):
-        raise RuntimeError(f"SmartAPI login failed: {session_data}")
-
-    return smart_api
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("option_orb_part2")
 
 
 # ============================================================
-# TIMEZONE & DATA CONVERSION
+# HELPERS & API
 # ============================================================
 
-def convert_dataframe_to_ist(df):
-    if df.empty or "timestamp" not in df.columns:
-        return df
-    
+def login():
+    api = SmartConnect(api_key=API_KEY)
+    otp = pyotp.TOTP(TOTP_SECRET).now()
+    response = api.generateSession(CLIENT_CODE, PASSWORD, otp)
+    if not isinstance(response, dict) or not response.get("status") or not response.get("data"):
+        raise RuntimeError(f"Login failed: {response}")
+    log.info("Angel One login successful.")
+    return api
+
+
+def fetch_candles(api, exchange, token, trading_day, from_time=dt_time(9, 0), to_time=dt_time(15, 30)):
+    start = datetime.combine(trading_day, from_time, tzinfo=IST)
+    end = datetime.combine(trading_day, to_time, tzinfo=IST)
+
+    params = {
+        "exchange": exchange,
+        "symboltoken": str(token),
+        "interval": CANDLE_INTERVAL,
+        "fromdate": start.strftime("%Y-%m-%d %H:%M"),
+        "todate": end.strftime("%Y-%m-%d %H:%M"),
+    }
+
+    response = api.getCandleData(params)
+    rows = response.get("data") if isinstance(response, dict) else None
+    if rows is None:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp"]).copy()
     
@@ -65,201 +98,117 @@ def convert_dataframe_to_ist(df):
         df["timestamp"] = df["timestamp"].dt.tz_localize(IST, ambiguous="NaT", nonexistent="shift_forward")
     else:
         df["timestamp"] = df["timestamp"].dt.tz_convert(IST)
-        
-    return df
+
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.sort_values("timestamp").reset_index(drop=True)
 
 
-# ============================================================
-# HISTORICAL DATA FETCHING
-# ============================================================
+def find_column(df, override, candidates, description):
+    if override:
+        if override not in df.columns:
+            raise ValueError(f"Configured {description} column '{override}' not found.")
+        return override
+    normalize = lambda value: "".join(ch for ch in str(value).lower() if ch.isalnum())
+    columns = {normalize(col): col for col in df.columns}
+    for candidate in candidates:
+        key = normalize(candidate)
+        if key in columns:
+            return columns[key]
+    raise ValueError(f"Cannot detect the {description} column.")
 
-def fetch_historical_candles(smart_api, exchange, symbol_token, from_date, to_date):
-    params = {
-        "exchange": exchange,
-        "symboltoken": str(symbol_token),
-        "interval": INTERVAL,
-        "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
-        "todate": to_date.strftime("%Y-%m-%d %H:%M"),
+
+def load_instruments():
+    if not INSTRUMENT_MASTER.exists():
+        raise FileNotFoundError(f"Instrument CSV not found: {INSTRUMENT_MASTER}")
+
+    df = pd.read_csv(INSTRUMENT_MASTER, dtype=str, sep=None, engine="python")
+    df.columns = [str(col).strip() for col in df.columns]
+
+    columns = {
+        "token": find_column(df, CSV_TOKEN, ["token", "symboltoken", "symbol_token", "instrument_token"], "token"),
+        "symbol": find_column(df, CSV_SYMBOL, ["symbol", "tradingsymbol", "trading_symbol"], "symbol"),
+        "name": find_column(df, CSV_NAME, ["name", "underlying", "underlyingsymbol"], "underlying name"),
+        "expiry": find_column(df, CSV_EXPIRY, ["expiry", "expirydate", "expiry_date"], "expiry"),
+        "strike": find_column(df, CSV_STRIKE, ["strike", "strikeprice", "strike_price"], "strike"),
+        "lotsize": find_column(df, CSV_LOTSIZE, ["lotsize", "lot_size", "marketlot"], "lot size"),
+        "type": find_column(df, CSV_TYPE, ["instrumenttype", "instrument_type"], "instrument type"),
+        "exchange": find_column(df, CSV_EXCHANGE, ["exch_seg", "exchange", "exchange_segment"], "exchange"),
     }
 
-    last_error = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = smart_api.getCandleData(params)
-            if response and response.get("status") and response.get("data") is not None:
-                data = response["data"]
-                if not data:
-                    return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
-                return convert_dataframe_to_ist(pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"]))
-            last_error = RuntimeError(f"Historical API response: {response}")
-        except Exception as exc:
-            last_error = exc
+    data = pd.DataFrame({
+        "token": df[columns["token"]].fillna("").astype(str).str.strip(),
+        "symbol": df[columns["symbol"]].fillna("").astype(str).str.strip(),
+        "name": df[columns["name"]].fillna("").astype(str).str.upper().str.strip(),
+        "expiry_raw": df[columns["expiry"]].fillna("").astype(str).str.strip(),
+        "strike_raw": df[columns["strike"]].fillna("").astype(str).str.strip(),
+        "lotsize_raw": df[columns["lotsize"]].fillna("").astype(str).str.strip(),
+        "type": df[columns["type"]].fillna("").astype(str).str.upper().str.strip(),
+        "exchange": df[columns["exchange"]].fillna("").astype(str).str.upper().str.strip(),
+    })
 
-        if attempt < MAX_RETRIES:
-            delay = RETRY_BASE_SECONDS * (2 ** (attempt - 1))
-            print(f"   Attempt {attempt}/{MAX_RETRIES} failed: {last_error}")
-            print(f"   Retrying in {delay} seconds...")
-            time_module.sleep(delay)
+    data["expiry"] = pd.to_datetime(data["expiry_raw"], errors="coerce", dayfirst=True).dt.date
+    data["strike"] = pd.to_numeric(data["strike_raw"], errors="coerce")
 
-    raise RuntimeError(f"Failed after {MAX_RETRIES} attempts: {last_error}")
+    if not data["strike"].dropna().empty and data["strike"].dropna().median() > 100000:
+        data["strike"] = data["strike"] / 100.0
 
+    data["lot_size"] = pd.to_numeric(data["lotsize_raw"], errors="coerce")
 
-# ============================================================
-# LOCAL INSTRUMENTS CSV LOOKUP HELPER
-# ============================================================
+    options = data[
+        (data["name"].eq("NIFTY") | data["symbol"].str.upper().str.startswith("NIFTY"))
+        & (data["type"].eq("OPTIDX") | data["symbol"].str.upper().str.endswith(("CE", "PE")))
+        & data["exchange"].eq("NFO")
+        & data["expiry"].notna()
+        & data["strike"].notna()
+        & (data["strike"] > 0)
+        & (data["lot_size"] > 0)
+        & data["token"].ne("")
+    ].copy()
 
-def find_option_token_from_csv(target_strike, option_type):
-    """
-    Reads local nifty_current_expiry.csv file and matches the target strike and option type (CE/PE).
-    """
-    if not os.path.exists(INSTRUMENTS_CSV_PATH):
-        raise FileNotFoundError(f"Instruments file not found at: {INSTRUMENTS_CSV_PATH}")
-
-    df_inst = pd.read_csv(INSTRUMENTS_CSV_PATH)
-    
-    # Standardize column names to lower case for reliable matching
-    df_inst.columns = [c.lower().strip() for c in df_inst.columns]
-    
-    # Common column name variations in Angel One master files:
-    # 'strike', 'symbol', 'symboltoken', 'token', 'instrumenttype', etc.
-    strike_col = next((c for c in df_inst.columns if 'strike' in c), 'strike')
-    token_col = next((c for c in df_inst.columns if 'token' in c or c == 'token'), 'symboltoken')
-    symbol_col = next((c for c in df_inst.columns if 'symbol' in c or 'tradingsymbol' in c), 'symbol')
-
-    # Angel One strike prices are often stored multiplied by 100 (e.g., 23500.00 or 2350000.00)
-    # We inspect the strike value format or cast safely.
-    for _, row in df_inst.iterrows():
-        raw_strike = str(row[strike_col])
-        try:
-            # Clean up trailing decimals if stored as float strings
-            clean_strike = float(raw_strike)
-            if clean_strike > 100000:  # e.g., 2350000.00 format
-                clean_strike = clean_strike / 100.0
-                
-            if int(clean_strike) == int(target_strike):
-                sym_str = str(row[symbol_col]).upper()
-                if sym_str.endswith(option_type):
-                    token_val = str(row[token_col]).split('.')[0] # Remove decimal if present
-                    return token_val, sym_str
-        except ValueError:
-            continue
-
-    raise RuntimeError(f"Could not locate matching option contract for Strike: {target_strike} and Type: {option_type} in CSV.")
+    log.info("Eligible NIFTY option contracts loaded: %d", len(options))
+    return options
 
 
-# ============================================================
-# MAIN OPTION ORB PROCESSOR
-# ============================================================
+def select_itm_contract(instruments, spot, breakout_type, today):
+    option_type = "CE" if breakout_type == "BUY" else "PE"
 
-def process_option_orb(smart_api, now_ist):
-    trading_date_str = now_ist.date().strftime("%Y-%m-%d")
+    eligible = instruments[
+        (instruments["expiry"] >= today)
+        & instruments["symbol"].str.upper().str.endswith(option_type)
+    ].copy()
 
-    if not os.path.exists(SIGNAL_FILE):
-        print(f"Signal file '{SIGNAL_FILE}' not found. Run Part 1 scanner first.")
-        return
+    if eligible.empty:
+        raise RuntimeError(f"No unexpired NIFTY {option_type} contracts found.")
 
-    sig_df = pd.read_csv(SIGNAL_FILE)
-    today_sig = sig_df[sig_df["date"] == trading_date_str]
+    expiry = min(eligible["expiry"])
+    eligible = eligible[eligible["expiry"] == expiry]
 
-    if today_sig.empty:
-        print(f"No breakout record found for today ({trading_date_str}) in {SIGNAL_FILE}.")
-        return
+    strikes = sorted(eligible["strike"].dropna().unique().tolist())
+    atm_strike = min(strikes, key=lambda val: abs(float(val) - float(spot)))
+    atm_strike = float(atm_strike)
 
-    row = today_sig.iloc[0]
-    signal = row["signal"]
-    index_name = row["index_name"]
-    symbol_token = str(row["symbol_token"])
+    target_strike = (atm_strike - 100) if option_type == "CE" else (atm_strike + 100)
 
-    print(f"Loaded Signal from CSV -> Date: {trading_date_str} | Index: {index_name} | Signal: {signal}")
-
-    if signal not in ["BUY", "SELL"]:
-        print(f"Signal is '{signal}'. No option trade to scan.")
-        return
-
-    # 1. Fetch current/latest spot price of the underlying index for today
-    start_dt = datetime.combine(now_ist.date(), time(9, 15), tzinfo=IST)
-    end_dt = datetime.combine(now_ist.date(), time(12, 0), tzinfo=IST)
-
-    spot_df = fetch_historical_candles(smart_api, EXCHANGE, symbol_token, start_dt, end_dt)
-    if spot_df.empty:
-        print("ERROR: Failed to fetch underlying spot candles.")
-        return
-
-    current_spot_price = float(spot_df.iloc[-1]["close"])
-    print(f"Current Underlying Spot Price: {current_spot_price:.2f}")
-
-    # 2. Round to nearest multiple of 50
-    rounded_spot = round(current_spot_price / 50) * 50
-    print(f"Rounded Spot (Nearest 50): {rounded_spot}")
-
-    # 3. Calculate Option Strike based on user rules:
-    # SELL signal -> +100 | BUY signal -> -100
-    if signal == "SELL":
-        target_strike = rounded_spot + 100
-        option_type = "PE"  # Bearish breakout -> Put option
+    selected = eligible[eligible["strike"].astype(float) == target_strike]
+    if selected.empty:
+        # Fallback to nearest if exact target strike missing
+        selected_record = min(eligible.to_dict('records'), key=lambda r: abs(float(r["strike"]) - target_strike))
+        row = pd.Series(selected_record)
+        target_strike = float(row["strike"])
     else:
-        target_strike = rounded_spot - 100
-        option_type = "CE"  # Bullish breakout -> Call option
+        row = selected.iloc[0]
 
-    print(f"Target Strike Calculated: {target_strike} {option_type}")
-
-    # 4. Find Option Token from local CSV file
-    opt_token, opt_symbol = find_option_token_from_csv(target_strike, option_type)
-    print(f"Found Option Symbol from CSV: {opt_symbol} | Token: {opt_token}")
-
-    # 5. Fetch 1-minute candles for the Option from 09:15 to 12:00
-    print(f"Fetching 1-minute candles for option {opt_symbol}...")
-    opt_candles = fetch_historical_candles(smart_api, "NFO", opt_token, start_dt, end_dt)
-
-    if opt_candles.empty:
-        print("ERROR: No candle data received for the option contract token.")
-        return
-
-    opt_candles = opt_candles.sort_values("timestamp").copy()
-    for col in ["open", "high", "low", "close", "volume"]:
-        opt_candles[col] = pd.to_numeric(opt_candles[col], errors="coerce")
-    opt_candles["time_obj"] = opt_candles["timestamp"].dt.time
-
-    # 6. Calculate Option ORB Range (09:15 to 09:44)
-    orb_candles = opt_candles[(opt_candles["time_obj"] >= time(9, 15)) & (opt_candles["time_obj"] <= time(9, 44))]
-    if len(orb_candles) < 15:
-        print(f"Insufficient ORB candles for option ({len(orb_candles)} candles found).")
-        return
-
-    opt_orb_high = float(orb_candles["high"].max())
-    opt_orb_low = float(orb_candles["low"].min())
-    opt_orb_midpoint = (opt_orb_high + opt_orb_low) / 2.0
-
-    # 7. Print to Terminal
-    print("\n" + "=" * 70)
-    print(f"OPTION ORB ANALYSIS REPORT (LOCAL CSV) - {opt_symbol}")
-    print("=" * 70)
-    print(f"Trading Date      : {trading_date_str}")
-    print(f"Underlying Signal : {signal}")
-    print(f"Option Contract   : {opt_symbol} (Token: {opt_token})")
-    print(f"Option ORB High   : {opt_orb_high:.2f}")
-    print(f"Option ORB Low    : {opt_orb_low:.2f}")
-    print(f"Option Midpoint   : {opt_orb_midpoint:.2f}")
-    print("=" * 70)
-
-    # 8. Save to Output CSV File
-    result_dict = {
-        "date": trading_date_str,
-        "signal": signal,
-        "underlying_spot": current_spot_price,
-        "option_symbol": opt_symbol,
-        "option_token": opt_token,
+    return {
+        "symbol": row["symbol"],
+        "token": row["token"],
+        "exchange": OPTION_EXCHANGE,
+        "expiry": expiry.isoformat(),
         "strike": target_strike,
         "option_type": option_type,
-        "option_orb_high": round(opt_orb_high, 2),
-        "option_orb_low": round(opt_orb_low, 2),
-        "option_orb_midpoint": round(opt_orb_midpoint, 2)
+        "lot_size": int(row["lot_size"]),
     }
-
-    df_out = pd.DataFrame([result_dict])
-    header = not os.path.exists(OUTPUT_FILE)
-    df_out.to_csv(OUTPUT_FILE, mode='a', index=False, header=header)
-    print(f"Results successfully saved to {OUTPUT_FILE}")
 
 
 # ============================================================
@@ -267,26 +216,96 @@ def process_option_orb(smart_api, now_ist):
 # ============================================================
 
 def main():
-    smart_api = None
+    log.info("Starting Part 2: Option ORB Scanner from Breakout Signal File...")
+
+    if not os.path.exists(SIGNAL_FILE):
+        log.error("Signal file '%s' not found. Run Part 1 first.", SIGNAL_FILE)
+        return
+
+    sig_df = pd.read_csv(SIGNAL_FILE)
+    if sig_df.empty:
+        log.error("Signal file '%s' is empty.", SIGNAL_FILE)
+        return
+
+    first_row = sig_df.iloc[0]
+    signal = str(first_row["signal"]).upper().strip()
+    index_name = str(first_row["index_name"])
+    symbol_token = str(first_row["symbol_token"])
+
+    log.info("Loaded from %s -> Date: %s | Index: %s | Token: %s | Signal: %s", 
+             SIGNAL_FILE, first_row.get("date", TEST_DATE), index_name, symbol_token, signal)
+
+    instruments = load_instruments()
+    api = login()
+
     try:
-        now_ist = datetime.now(IST)
-        smart_api = login_to_smartapi()
+        # 1. Fetch candles for underlying index to get current price
+        spot_df = fetch_candles(api, SPOT_EXCHANGE, symbol_token, TEST_DATE, from_time=dt_time(9, 15), to_time=dt_time(12, 0))
+        if spot_df.empty:
+            log.error("No candle data received for underlying index token %s", symbol_token)
+            return
 
+        current_price = float(spot_df.iloc[-1]["close"])
+        log.info("Current Underlying Price: %.2f", current_price)
+
+        # 2. Select option contract using working reference logic
+        contract = select_itm_contract(instruments, current_price, signal, TEST_DATE)
+        log.info("Selected Option Contract Symbol: %s | Token: %s | Strike: %s", contract["symbol"], contract["token"], contract["strike"])
+
+        # 3. Fetch 1-minute candles for the option contract specifically for the 09:15 to 09:45 window
+        option_df = fetch_candles(api, OPTION_EXCHANGE, contract["token"], TEST_DATE, from_time=ORB_START_TIME, to_time=ORB_END_TIME)
+        if option_df.empty:
+            log.error("No candle data received for option contract %s during window 09:15 to 09:45", contract["symbol"])
+            return
+
+        option_df["time_obj"] = option_df["timestamp"].dt.time
+        opt_orb_candles = option_df[(option_df["time_obj"] >= ORB_START_TIME) & (option_df["time_obj"] <= ORB_END_TIME)]
+
+        if opt_orb_candles.empty:
+            log.error("Insufficient option ORB candles found for time window 09:15 to 09:45.")
+            return
+
+        # 4. Compute Option ORB High, Low, and Midpoint
+        opt_orb_high = float(opt_orb_candles["high"].max())
+        opt_orb_low = float(opt_orb_candles["low"].min())
+        opt_orb_midpoint = (opt_orb_high + opt_orb_low) / 2.0
+
+        # 5. Print Report to Terminal
+        print("\n" + "=" * 70)
+        print(f"OPTION ORB ANALYSIS REPORT - {contract['symbol']}")
         print("=" * 70)
-        print(f"ANGLEONE OPTION ORB SCANNER - LOCAL CSV ({now_ist.date()})")
+        print(f"Trading Date        : {TEST_DATE}")
+        print(f"Index Signal        : {signal} ({index_name})")
+        print(f"Underlying Price    : {current_price:.2f}")
+        print(f"Option Contract     : {contract['symbol']} (Token: {contract['token']})")
+        print(f"Option ORB High     : {opt_orb_high:.2f}")
+        print(f"Option ORB Low      : {opt_orb_low:.2f}")
+        print(f"Option ORB Midpoint : {opt_orb_midpoint:.2f}")
         print("=" * 70)
 
-        process_option_orb(smart_api, now_ist)
-        print("\nOption scan completed successfully.")
+        # 6. Save to Output CSV File
+        result_dict = {
+            "date": str(TEST_DATE),
+            "signal": signal,
+            "underlying_price": current_price,
+            "option_symbol": contract["symbol"],
+            "option_token": contract["token"],
+            "strike": contract["strike"],
+            "option_type": contract["option_type"],
+            "option_orb_high": round(opt_orb_high, 2),
+            "option_orb_low": round(opt_orb_low, 2),
+            "option_orb_midpoint": round(opt_orb_midpoint, 2),
+        }
+        df_out = pd.DataFrame([result_dict])
+        header = not os.path.exists(OUTPUT_FILE)
+        df_out.to_csv(OUTPUT_FILE, mode='a', index=False, header=header)
+        log.info("Results successfully saved to %s", OUTPUT_FILE)
 
-    except Exception as exc:
-        print(f"\nERROR: {exc}")
     finally:
-        if smart_api:
+        if api is not None:
             try:
-                smart_api.terminateSession(CLIENT_CODE)
-                print("\nSmartAPI session terminated.")
-            except:
+                api.terminateSession(CLIENT_CODE)
+            except Exception:
                 pass
 
 

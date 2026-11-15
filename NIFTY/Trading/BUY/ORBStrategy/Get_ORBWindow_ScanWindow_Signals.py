@@ -162,18 +162,12 @@ def scan_todays_breakout(smart_api, now_ist):
         elif row["high"] > orb_high:
             breakout_type = "BUY"
             breakout_time = row["timestamp"].strftime("%H:%M:%S")
-            breakout_price = row["high"]
-            breakout_candle_time = row["time_obj"]
-            breakout_row = row
-            breaklog_text = f"BUY Breakout detected at {breakout_time} (Price: {breakout_price:.2f} > ORB High {orb_high:.2f})"
+            breaklog_text = f"BUY Breakout detected at {breakout_time} (Price: {row['high']:.2f} > ORB High {orb_high:.2f})"
             break
         elif row["low"] < orb_low:
             breakout_type = "SELL"
             breakout_time = row["timestamp"].strftime("%H:%M:%S")
-            breakout_price = row["low"]
-            breakout_candle_time = row["time_obj"]
-            breakout_row = row
-            breaklog_text = f"SELL Breakout detected at {breakout_time} (Price: {breakout_price:.2f} < ORB Low {orb_low:.2f})"
+            breaklog_text = f"SELL Breakout detected at {breakout_time} (Price: {row['low']:.2f} < ORB Low {orb_low:.2f})"
             break
 
     if not breakout_type:
@@ -216,14 +210,18 @@ def scan_todays_breakout(smart_api, now_ist):
 def main():
     smart_api = None
     try:
-        now_ist = datetime.now(IST)
+        # For testing: manually inject a past trading date
+        now_ist = datetime(2026, 11, 13, 12, 5, tzinfo=IST)
+        # For live trading, uncomment below:
+        # now_ist = datetime.now(IST)
+
         smart_api = login_to_smartapi()
 
         print("=" * 70)
         print(f"ANGLEONE LIVE ORB SCANNER - {INDEX_NAME} ({now_ist.date()})")
         print("=" * 70)
 
-        signal_info = scan_todays_breakout(smart_api, now_ist)
+        scan_todays_breakout(smart_api, now_ist)
         print("\nScan completed successfully.")
 
     except Exception as exc:
