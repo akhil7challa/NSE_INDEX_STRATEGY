@@ -41,8 +41,8 @@ RETRY_BASE_SECONDS = 2
 # ============================================================
 
 ORB_START_TIME = time(9, 15)
-ORB_END_TIME = time(9, 45)
-TRADE_SCAN_START_TIME = time(9, 50)
+ORB_END_TIME = time(9, 44)
+TRADE_SCAN_START_TIME = time(9, 45)
 TRADE_DEADLINE_TIME = time(12, 0)
 TRADE_ENTRY_TIME = time(15, 9)
 EXIT_TIME = time(15, 14)
