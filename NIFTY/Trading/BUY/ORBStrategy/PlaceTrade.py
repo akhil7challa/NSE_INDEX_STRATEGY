@@ -47,7 +47,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("option_orb_part3")
+log = logging.getLogger("option_orb_buyer")
 
 
 # ============================================================
@@ -94,9 +94,7 @@ def fetch_candles(api, exchange, token, trading_day, from_time=dt_time(9, 15), t
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # 1-second safety buffer to respect Angel One rate limits
             time.sleep(1.0)
-            
             response = api.getCandleData(params)
             
             if response and isinstance(response, dict):
@@ -127,8 +125,6 @@ def fetch_candles(api, exchange, token, trading_day, from_time=dt_time(9, 15), t
         except Exception as exc:
             last_error = exc
             log.warning(f"Candle fetch attempt {attempt}/{MAX_RETRIES} failed for token {token}: {exc}")
-            if "exceeding access rate" in str(exc).lower():
-                log.info("Rate limit exception caught. Backing off...")
 
         if attempt < MAX_RETRIES:
             delay = RETRY_BASE_SECONDS * (2 ** (attempt - 1))
@@ -181,11 +177,11 @@ def place_market_order(api, symbol, token, transaction_type, quantity, simulated
 
 
 # ============================================================
-# STRATEGY EXECUTION & TRAILING STOP-LOSS MANAGEMENT
+# OPTION BUYER STRATEGY & TRAILING STOP-LOSS MANAGEMENT
 # ============================================================
 
 def execute_strategy():
-    log.info("Starting Part 3: Market Entry at 15:09 and Exit at 15:14 candle close...")
+    log.info("Starting Option Buyer Strategy: Long Entry at 15:09 and Exit at 15:14 candle close...")
 
     if not os.path.exists(ANALYSIS_FILE):
         log.error("Analysis file '%s' not found. Run Part 2 first.", ANALYSIS_FILE)
@@ -198,7 +194,7 @@ def execute_strategy():
 
     row = analysis_df.iloc[-1]
     trading_date = datetime.strptime(str(row["date"]), "%Y-%m-%d").date()
-    signal = str(row["signal"]).upper().strip()
+    signal = str(row["signal"]).upper().strip()  # BUY (CE) or SELL (PE) underlying signal
     option_symbol = str(row["option_symbol"])
     option_token = str(row["option_token"])
     opt_orb_high = float(row["option_orb_high"])
@@ -214,7 +210,7 @@ def execute_strategy():
         lot_size = 65
         quantity = lot_size * LOTS
 
-        # Fetch candles around the session to extract exact 15:09 and 15:14 candle prices
+        # Fetch candles around the session to extract exact 15:09 entry and 15:14 exit prices
         candles = fetch_candles(api, OPTION_EXCHANGE, option_token, trading_date, from_time=dt_time(15, 5), to_time=dt_time(15, 16))
         
         # Determine 15:09 entry close price
@@ -225,37 +221,37 @@ def execute_strategy():
         elif not candles.empty:
             entry_price = float(candles.iloc[0]["close"])
 
-        # 1. Entry Order
+        # 1. Entry Order (Always BUY as an Option Buyer)
         if LIVE_TRADING == "YES":
             target_entry_dt = datetime.combine(trading_date, ENTRY_TIME, tzinfo=IST)
             while datetime.now(IST) < target_entry_dt:
                 time.sleep(POLL_SECONDS)
 
-        log.info("Executing MARKET BUY entry for %s at 15:09 candle close...", option_symbol)
+        log.info("Executing LONG MARKET BUY entry for %s at 15:09 candle close...", option_symbol)
         entry_order = place_market_order(api, option_symbol, option_token, "BUY", quantity, simulated_price=entry_price)
         entry_price = float(entry_order["average_price"])
-        log.info("Entry Executed at Average Price: %.2f", entry_price)
+        log.info("Long Entry Executed at Average Price: %.2f", entry_price)
 
         # ========================================================
-        # 2. INITIAL STOP-LOSS (Matching Backtest Strategy Logic)
+        # 2. INITIAL STOP-LOSS (Option Buyer: Always BELOW Entry)
         # ========================================================
-        if signal == "BUY":
-            initial_sl = opt_orb_midpoint if entry_price > opt_orb_high else opt_orb_low
-        else:
-            initial_sl = opt_orb_midpoint if entry_price < opt_orb_low else opt_orb_high
+        # For a long option, stop loss is placed below entry. 
+        # Using opt_orb_low or midpoint, ensuring it does not exceed entry price.
+        candidate_sl = opt_orb_low if opt_orb_low < entry_price else opt_orb_midpoint
+        initial_sl = min(candidate_sl, entry_price * 0.90)  # Max 10% risk safeguard if needed, or fallback to opt_orb_low
 
         current_stop_loss = initial_sl
-        initial_risk_distance = abs(entry_price - initial_sl)
+        initial_risk_distance = abs(entry_price - current_stop_loss)
         trailing_step = initial_risk_distance * 0.20
 
-        log.info("Initial Stop-Loss set to: %.2f (Risk Distance: %.2f, Step: %.2f)", 
+        log.info("Initial Stop-Loss set to: %.2f (Risk Distance: %.2f, Trailing Step: %.2f)", 
                  current_stop_loss, initial_risk_distance, trailing_step)
 
         exit_reason = "15:14 Candle Close Square-off"
         exit_price = entry_price
 
         # ========================================================
-        # 3. TRAILING STOP-LOSS RATIO / CANDLE MONITORING
+        # 3. TRAILING STOP-LOSS MONITORING (Upward Ratchet for Long Option)
         # ========================================================
         if LIVE_TRADING != "YES":
             active_candles = candles[(candles["timestamp"].dt.time >= ENTRY_TIME) & (candles["timestamp"].dt.time <= EXIT_TIME)]
@@ -266,35 +262,28 @@ def execute_strategy():
                 c_close = float(c_row["close"])
                 t_obj = c_row["timestamp"].time()
 
-                # A. Check Stop-Loss Hit on candle close
-                if signal == "BUY" and c_close <= current_stop_loss:
-                    exit_price = float(current_stop_loss)
-                    exit_reason = f"Trailing Stop Loss Hit at {t_obj}"
-                    break
-                elif signal == "SELL" and c_close >= current_stop_loss:
+                # A. Check Stop-Loss Hit on candle close (Option price drops to or below stop-loss)
+                if c_close <= current_stop_loss:
                     exit_price = float(current_stop_loss)
                     exit_reason = f"Trailing Stop Loss Hit at {t_obj}"
                     break
 
-                # B. Ratchet stop-loss 20% closer toward entry on each 1-min close
-                if signal == "BUY":
-                    new_sl = current_stop_loss + trailing_step
-                    if new_sl <= entry_price:
-                        current_stop_loss = new_sl
-                else:
-                    new_sl = current_stop_loss - trailing_step
-                    if new_sl >= entry_price:
-                        current_stop_loss = new_sl
+                # B. Ratchet stop-loss upwards as price rises in favor of the option buyer
+                new_sl = current_stop_loss + trailing_step
+                # Optional: cap stop-loss at entry price once profit threshold is reached
+                if new_sl <= c_close:
+                    current_stop_loss = new_sl
 
                 exit_price = c_close  # Default to latest close if no stop hit
 
-        # 4. Exit Order Execution
+        # 4. Exit Order Execution (Always SELL to close long option)
         log.info("Executing MARKET SELL exit for %s due to: %s", option_symbol, exit_reason)
         exit_order = place_market_order(api, option_symbol, option_token, "SELL", quantity, simulated_price=exit_price)
         if LIVE_TRADING == "YES":
             exit_price = float(exit_order["average_price"])
 
-        pnl = (exit_price - entry_price) * quantity if signal == "BUY" else (entry_price - exit_price) * quantity
+        # P&L for a Long Option Buyer: (Exit Price - Entry Price) * Quantity
+        pnl = (exit_price - entry_price) * quantity
 
         # 5. Save Trade Log Results
         trade_result = {
@@ -313,7 +302,7 @@ def execute_strategy():
         df_trade.to_csv(TRADE_LOG, mode='a', index=False, header=header)
 
         print("\n" + "=" * 70)
-        print(f"TRADE EXECUTION & P&L REPORT - {option_symbol}")
+        print(f"OPTION BUYER TRADE REPORT - {option_symbol}")
         print("=" * 70)
         print(f"Trading Date     : {trading_date}")
         print(f"Entry Time / Px  : 15:09 (Close ~ {entry_price:.2f})")

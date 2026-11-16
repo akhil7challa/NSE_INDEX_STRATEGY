@@ -226,7 +226,7 @@ def main():
     smart_api = None
     try:
         # For testing: manually inject a past trading date
-        now_ist = datetime(2026, 11, 13, 12, 5, tzinfo=IST)
+        now_ist = datetime(2026, 11, 11, 12, 5, tzinfo=IST)
         # For live trading, uncomment below:
         # now_ist = datetime.now(IST)
 

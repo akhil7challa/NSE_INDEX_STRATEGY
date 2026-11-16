@@ -22,7 +22,7 @@ PASSWORD = "1606"
 TOTP_SECRET = "H2FHHI2DVFW5HK64J3GQWMVZ3E"
 
 # Test Date Configuration
-TEST_DATE = date(2026, 11, 13)  # Change this to any past trading date you want to test
+TEST_DATE = date(2026, 11, 11)  # Change this to any past trading date you want to test
 
 INSTRUMENT_MASTER = Path(
     r"C:\Users\challa\Desktop\Challa\Personal\NSE\NIFTY"
