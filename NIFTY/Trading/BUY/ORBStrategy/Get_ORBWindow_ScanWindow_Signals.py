@@ -23,8 +23,8 @@ INDEX_NAME = "NIFTY 50"
 INTERVAL = "ONE_MINUTE"
 IST = ZoneInfo("Asia/Kolkata")
 
-MAX_RETRIES = 4
-RETRY_BASE_SECONDS = 2
+MAX_RETRIES = 5
+RETRY_BASE_SECONDS = 3
 
 # ============================================================
 # STRATEGY RULES (MATCHING BACKTEST)
@@ -78,7 +78,7 @@ def convert_dataframe_to_ist(df):
 
 
 # ============================================================
-# HISTORICAL DATA FETCHING
+# HISTORICAL DATA FETCHING WITH RATE-LIMIT HANDLING
 # ============================================================
 
 def fetch_historical_data(smart_api, from_date, to_date):
@@ -93,17 +93,32 @@ def fetch_historical_data(smart_api, from_date, to_date):
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            # Small buffer before request to respect API rate restrictions
+            time_module.sleep(0.5)
+            
             response = smart_api.getCandleData(params)
-            if response and response.get("status") and response.get("data") is not None:
-                data = response["data"]
-                if not data:
-                    return pd.DataFrame(columns=CANDLE_COLUMNS)
-                return convert_dataframe_to_ist(pd.DataFrame(data, columns=CANDLE_COLUMNS))
-            last_error = RuntimeError(f"Historical API response: {response}")
+            
+            # Check if response indicates a rate limit or server error message
+            if response and isinstance(response, dict):
+                message = str(response.get("message", "")).lower()
+                if "access rate" in message or "exceeding" in message:
+                    raise RuntimeError(f"Rate limit hit: {response.get('message')}")
+                
+                if response.get("status") and response.get("data") is not None:
+                    data = response["data"]
+                    if not data:
+                        return pd.DataFrame(columns=CANDLE_COLUMNS)
+                    return convert_dataframe_to_ist(pd.DataFrame(data, columns=CANDLE_COLUMNS))
+            
+            last_error = RuntimeError(f"Historical API response invalid: {response}")
         except Exception as exc:
             last_error = exc
+            # Also catch raw string errors in exceptions if server returns byte-string messages
+            if "exceeding access rate" in str(exc).lower():
+                print(f"   Rate limit exception caught: {exc}")
 
         if attempt < MAX_RETRIES:
+            # Exponential backoff: 3s, 6s, 12s, 24s, etc.
             delay = RETRY_BASE_SECONDS * (2 ** (attempt - 1))
             print(f"   Attempt {attempt}/{MAX_RETRIES} failed: {last_error}")
             print(f"   Retrying in {delay} seconds...")
@@ -155,6 +170,7 @@ def scan_todays_breakout(smart_api, now_ist):
     scan_candles = raw_df[(raw_df["time_obj"] >= TRADE_SCAN_START_TIME) & (raw_df["time_obj"] <= TRADE_DEADLINE_TIME)]
     breakout_type = None
     breakout_time = None
+    breaklog_text = ""
 
     for _, row in scan_candles.iterrows():
         if row["high"] > orb_high and row["low"] < orb_low:
@@ -172,7 +188,7 @@ def scan_todays_breakout(smart_api, now_ist):
 
     if not breakout_type:
         print("No breakout occurred today by 12:00 PM.")
-        return {
+        result_dict = {
             "date": str(trading_date),
             "breakout_time": "N/A",
             "index_name": INDEX_NAME,
@@ -181,18 +197,17 @@ def scan_todays_breakout(smart_api, now_ist):
             "orb_high": orb_high,
             "orb_low": orb_low
         }
-
-    print(breaklog_text)
-    
-    result_dict = {
-        "date": str(trading_date),
-        "breakout_time": breakout_time,
-        "index_name": INDEX_NAME,
-        "symbol_token": SYMBOL_TOKEN,
-        "signal": breakout_type,
-        "orb_high": orb_high,
-        "orb_low": orb_low
-    }
+    else:
+        print(breaklog_text)
+        result_dict = {
+            "date": str(trading_date),
+            "breakout_time": breakout_time,
+            "index_name": INDEX_NAME,
+            "symbol_token": SYMBOL_TOKEN,
+            "signal": breakout_type,
+            "orb_high": orb_high,
+            "orb_low": orb_low
+        }
 
     # Save to CSV output file
     df_out = pd.DataFrame([result_dict])

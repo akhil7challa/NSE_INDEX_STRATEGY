@@ -35,6 +35,9 @@ LOTS = 1
 ENTRY_TIME = dt_time(15, 9)
 EXIT_TIME = dt_time(15, 14)
 
+MAX_RETRIES = 5
+RETRY_BASE_SECONDS = 3
+
 # ============================================================
 # LOGGING
 # ============================================================
@@ -48,17 +51,32 @@ log = logging.getLogger("option_orb_part3")
 
 
 # ============================================================
-# HELPERS & API
+# HELPERS & API (WITH RETRIES & RATE-LIMIT RESILIENCE)
 # ============================================================
 
 def login():
-    api = SmartConnect(api_key=API_KEY)
-    otp = pyotp.TOTP(TOTP_SECRET).now()
-    response = api.generateSession(CLIENT_CODE, PASSWORD, otp)
-    if not isinstance(response, dict) or not response.get("status") or not response.get("data"):
-        raise RuntimeError(f"Login failed: {response}")
-    log.info("Angel One login successful.")
-    return api
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            log.info(f"Attempting SmartAPI login (Attempt {attempt}/{MAX_RETRIES})...")
+            api = SmartConnect(api_key=API_KEY)
+            otp = pyotp.TOTP(TOTP_SECRET).now()
+            response = api.generateSession(CLIENT_CODE, PASSWORD, otp)
+            if isinstance(response, dict) and response.get("status") and response.get("data"):
+                log.info("Angel One login successful.")
+                return api
+            else:
+                last_error = RuntimeError(f"Login response invalid: {response}")
+        except Exception as exc:
+            last_error = exc
+            log.warning(f"Login attempt {attempt} encountered exception: {exc}")
+
+        if attempt < MAX_RETRIES:
+            delay = RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            log.info(f"Retrying login in {delay} seconds...")
+            time.sleep(delay)
+
+    raise RuntimeError(f"Failed to log in after {MAX_RETRIES} attempts: {last_error}")
 
 
 def fetch_candles(api, exchange, token, trading_day, from_time=dt_time(9, 15), to_time=dt_time(15, 30)):
@@ -73,24 +91,52 @@ def fetch_candles(api, exchange, token, trading_day, from_time=dt_time(9, 15), t
         "todate": end.strftime("%Y-%m-%d %H:%M"),
     }
 
-    response = api.getCandleData(params)
-    rows = response.get("data") if isinstance(response, dict) else None
-    if rows is None:
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            # 1-second safety buffer to respect Angel One rate limits
+            time.sleep(1.0)
+            
+            response = api.getCandleData(params)
+            
+            if response and isinstance(response, dict):
+                message = str(response.get("message", "")).lower()
+                if "access rate" in message or "exceeding" in message:
+                    raise RuntimeError(f"Rate limit hit: {response.get('message')}")
+                
+                rows = response.get("data")
+                if rows is not None:
+                    if not rows:
+                        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    
+                    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                    df = df.dropna(subset=["timestamp"]).copy()
+                    
+                    if df["timestamp"].dt.tz is None:
+                        df["timestamp"] = df["timestamp"].dt.tz_localize(IST, ambiguous="NaT", nonexistent="shift_forward")
+                    else:
+                        df["timestamp"] = df["timestamp"].dt.tz_convert(IST)
 
-    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    df = df.dropna(subset=["timestamp"]).copy()
-    
-    if df["timestamp"].dt.tz is None:
-        df["timestamp"] = df["timestamp"].dt.tz_localize(IST, ambiguous="NaT", nonexistent="shift_forward")
-    else:
-        df["timestamp"] = df["timestamp"].dt.tz_convert(IST)
+                    for col in ["open", "high", "low", "close", "volume"]:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+                    return df.sort_values("timestamp").reset_index(drop=True)
+            
+            last_error = RuntimeError(f"Candle API response invalid: {response}")
+        except Exception as exc:
+            last_error = exc
+            log.warning(f"Candle fetch attempt {attempt}/{MAX_RETRIES} failed for token {token}: {exc}")
+            if "exceeding access rate" in str(exc).lower():
+                log.info("Rate limit exception caught. Backing off...")
 
-    return df.sort_values("timestamp").reset_index(drop=True)
+        if attempt < MAX_RETRIES:
+            delay = RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            log.info(f"Retrying candle fetch in {delay} seconds...")
+            time.sleep(delay)
+
+    log.error(f"Failed to fetch candles for token {token} after {MAX_RETRIES} attempts.")
+    return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
 
 def place_market_order(api, symbol, token, transaction_type, quantity, simulated_price=None):
