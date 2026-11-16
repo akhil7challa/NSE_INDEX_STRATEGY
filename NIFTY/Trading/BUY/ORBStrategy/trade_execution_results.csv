@@ -1,0 +1,2 @@
+date,symbol,signal,entry_price,initial_stop_loss,final_stop_loss,exit_price,quantity,pnl,exit_reason
+2026-11-11,NIFTY17NOV2625300CE,BUY,172.9,146.97,172.92,175.55,65,172.25,15:14 Candle Close Square-off
