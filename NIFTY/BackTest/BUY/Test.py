@@ -43,9 +43,9 @@ RETRY_BASE_SECONDS = 2
 ORB_START_TIME = time(9, 15)
 ORB_END_TIME = time(9, 44)
 TRADE_SCAN_START_TIME = time(9, 45)
-TRADE_DEADLINE_TIME = time(12, 0)
-TRADE_ENTRY_TIME = time(15, 9)
-EXIT_TIME = time(15, 14)
+TRADE_DEADLINE_TIME = time(11, 59)
+TRADE_ENTRY_TIME = time(12, 0)
+EXIT_TIME = time(15, 0)
 MIN_ORB_RANGE_PCT = 0.0
 
 CANDLE_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
@@ -243,12 +243,24 @@ def analyze_day(trading_date, day_df):
     if entry_candle.empty:
         return result_row
 
-    entry_price = float(entry_candle.iloc[0]["close"])
     
+    entry_price = float(entry_candle.iloc[0]["close"])
+
+    # Skip invalid BUY and SELL entries
+    if breakout_type == "BUY" and entry_price < orb_low:
+        result_row["exit_reason"] = "BUY Entry Below ORB Low - Trade Skipped"
+        return result_row
+
+    if breakout_type == "SELL" and entry_price > orb_high:
+        result_row["exit_reason"] = "SELL Entry Above ORB High - Trade Skipped"
+        return result_row
+
+    # Original Stop-Loss Logic (Unchanged)
     if breakout_type == "BUY":
         initial_sl = orb_midpoint if entry_price > orb_high else orb_low
     else:
         initial_sl = orb_midpoint if entry_price < orb_low else orb_high
+
 
     current_stop_loss = initial_sl
     initial_risk_distance = abs(entry_price - initial_sl)
